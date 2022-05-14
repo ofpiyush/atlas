@@ -300,7 +300,7 @@ func TestExecutor(t *testing.T) {
 	dir, err := migrate.NewLocalDir(t.TempDir())
 	require.NoError(t, err)
 	ex, err = migrate.NewExecutor(&mockDriver{}, dir, nil)
-	require.EqualError(t, err, "sql/migrate: execute: mockRevisionReadWriter cannot be nil")
+	require.EqualError(t, err, "sql/migrate: execute: rrw cannot be nil")
 	require.Nil(t, ex)
 
 	// Does not work if no locking mechanism is provided.

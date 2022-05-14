@@ -9,8 +9,12 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"net/url"
+	"os"
+	"strconv"
 	"strings"
 
+	entmigrate "ariga.io/atlas/cmd/atlascmd/migrate"
 	"ariga.io/atlas/sql/migrate"
 	"ariga.io/atlas/sql/schema"
 	"ariga.io/atlas/sql/sqlclient"
@@ -25,21 +29,23 @@ const (
 	migrateFlagDir         = "dir"
 	migrateFlagForce       = "force"
 	migrateFlagFormat      = "format"
+	migrateFlagLog         = "log"
+	migrateFlagTo          = "to"
 	migrateFlagSchema      = "schema"
-	migrateDiffFlagTo      = "to"
 	migrateDiffFlagVerbose = "verbose"
 )
 
 var (
 	// MigrateFlags are the flags used in MigrateCmd (and sub-commands).
 	MigrateFlags struct {
-		DirURL  string
-		DevURL  string
-		ToURL   string
-		Schemas []string
-		Format  string
-		Force   bool
-		Verbose bool
+		DirURL    string
+		DevURL    string
+		ToURL     string
+		Schemas   []string
+		Format    string
+		LogFormat string
+		Force     bool
+		Verbose   bool
 	}
 	// MigrateCmd represents the migrate command. It wraps several other sub-commands.
 	MigrateCmd = &cobra.Command{
@@ -69,6 +75,21 @@ to re-hash the contents and resolve the error
 			}
 			return nil
 		},
+	}
+	// MigrateApplyCmd represents the 'atlas migrate apply' subcommand.
+	MigrateApplyCmd = &cobra.Command{
+		Use:   "apply",
+		Short: "Applies pending migration files on the connected database.",
+		Long: `'atlas migrate apply' reads the migration state of the connected database and computes what migrations are pending.
+It then attempts to apply the pending migration files in the correct order onto the database. 
+The first argument denotes the maximum number of migration files to apply.
+As a safety measure 'atlas migrate apply' will abort with an error, if:
+  - the migration directory is not integer according to the 'atlas.sum' file
+  - the migration and database history do not match each other`,
+		Example: `  atlas migrate apply --to mysql://user:pass@localhost:3306/dbname
+  atlas migrate apply 1 --dir file:///path/to/migration/directory --to mysql://user:pass@localhost:3306/dbname`,
+		Args: cobra.MaximumNArgs(1),
+		RunE: CmdMigrateApplyRun,
 	}
 	// MigrateDiffCmd represents the 'atlas migrate diff' subcommand.
 	MigrateDiffCmd = &cobra.Command{
@@ -108,8 +129,8 @@ This command should be used whenever a manual change in the migration directory 
 the atlas.sum file. If there is a mismatch it will be reported. If the --dev-url flag is given, the migration files are 
 executed on the connected database in order to validate SQL semantics.`,
 		Example: `  atlas migrate validate
-  atlas migrate validate --dir /path/to/migration/directory
-  atlas migrate validate --dir /path/to/migration/directory --dev-url mysql://user:pass@localhost:3306/dev`,
+  atlas migrate validate --dir file:///path/to/migration/directory
+  atlas migrate validate --dir file:///path/to/migration/directory --dev-url mysql://user:pass@localhost:3306/dev`,
 		RunE: CmdMigrateValidateRun,
 	}
 )
@@ -117,6 +138,7 @@ executed on the connected database in order to validate SQL semantics.`,
 func init() {
 	// Add sub-commands.
 	Root.AddCommand(MigrateCmd)
+	MigrateCmd.AddCommand(MigrateApplyCmd)
 	MigrateCmd.AddCommand(MigrateDiffCmd)
 	MigrateCmd.AddCommand(MigrateHashCmd)
 	MigrateCmd.AddCommand(MigrateNewCmd)
@@ -125,21 +147,71 @@ func init() {
 	devURL := func(set *pflag.FlagSet) {
 		set.StringVarP(&MigrateFlags.DevURL, migrateFlagDevURL, "", "", "[driver://username:password@address/dbname?param=value] select a data source using the URL format")
 	}
+	toURL := func(set *pflag.FlagSet) {
+		set.StringVarP(&MigrateFlags.ToURL, migrateFlagTo, "", "", "[driver://username:password@address/dbname?param=value] select a data source using the URL format")
+	}
 	// Global flags.
 	MigrateCmd.PersistentFlags().StringVarP(&MigrateFlags.DirURL, migrateFlagDir, "", "file://migrations", "select migration directory using URL format")
 	MigrateCmd.PersistentFlags().StringSliceVarP(&MigrateFlags.Schemas, migrateFlagSchema, "", nil, "set schema names")
 	MigrateCmd.PersistentFlags().StringVarP(&MigrateFlags.Format, migrateFlagFormat, "", formatAtlas, "set migration file format")
 	MigrateCmd.PersistentFlags().BoolVarP(&MigrateFlags.Force, migrateFlagForce, "", false, "force a command to run on a broken migration directory state")
 	MigrateCmd.PersistentFlags().SortFlags = false
+	// Apply flags.
+	MigrateApplyCmd.Flags().StringVarP(&MigrateFlags.LogFormat, migrateFlagLog, "", logFormatTTY, "log format to use")
+	toURL(MigrateApplyCmd.Flags())
 	// Diff flags.
 	devURL(MigrateDiffCmd.Flags())
-	MigrateDiffCmd.Flags().StringVarP(&MigrateFlags.ToURL, migrateDiffFlagTo, "", "", "[driver://username:password@address/dbname?param=value] select a data source using the URL format")
+	toURL(MigrateDiffCmd.Flags())
 	MigrateDiffCmd.Flags().BoolVarP(&MigrateFlags.Verbose, migrateDiffFlagVerbose, "", false, "enable verbose logging")
 	MigrateDiffCmd.Flags().SortFlags = false
 	cobra.CheckErr(MigrateDiffCmd.MarkFlagRequired(migrateFlagDevURL))
-	cobra.CheckErr(MigrateDiffCmd.MarkFlagRequired(migrateDiffFlagTo))
+	cobra.CheckErr(MigrateDiffCmd.MarkFlagRequired(migrateFlagTo))
 	// Validate flags.
 	devURL(MigrateValidateCmd.Flags())
+}
+
+// CmdMigrateApplyRun is the command executed when running the CLI with 'migrate apply' args.
+func CmdMigrateApplyRun(cmd *cobra.Command, args []string) error {
+	var (
+		n   int
+		err error
+	)
+	if len(args) > 1 {
+		n, err = strconv.Atoi(args[1])
+		if err != nil {
+			return err
+		}
+	}
+	// Open the migration directory.
+	dir, err := dir()
+	if err != nil {
+		return err
+	}
+	// Open a client to the database.
+	target, err := sqlclient.Open(cmd.Context(), MigrateFlags.ToURL)
+	if err != nil {
+		return err
+	}
+	// Get the correct log format and destination.
+	l, err := logFormat(os.Stdout)
+	if err != nil {
+		return err
+	}
+	// Currently, only in DB revisions are supported. // TODO(masseelch): I do not like this without a flag present.
+	u, err := url.Parse(MigrateFlags.ToURL)
+	if err != nil {
+		return err
+	}
+	rrw := entmigrate.NewEntRevisions(target.DB, u.Scheme)
+	if err := rrw.Init(cmd.Context()); err != nil {
+		return err
+	}
+	// Get the executor.
+	ex, err := migrate.NewExecutor(target.Driver, dir, rrw, migrate.WithLogger(l))
+	if err != nil {
+		return err
+	}
+	return ex.Execute(cmd.Context(), n)
 }
 
 // CmdMigrateDiffRun is the command executed when running the CLI with 'migrate diff' args.
@@ -334,5 +406,24 @@ func formatter() (migrate.Formatter, error) {
 		return sqltool.LiquibaseFormatter, nil
 	default:
 		return nil, fmt.Errorf("unknown format %q", MigrateFlags.Format)
+	}
+}
+
+const (
+	logFormatTTY = "tty"
+)
+
+type LogTTY struct{ out io.Writer }
+
+func (l *LogTTY) Log(e migrate.LogEntry) {
+	_, _ = l.out.Write([]byte("I am not yet implemented!"))
+}
+
+func logFormat(out io.Writer) (migrate.Logger, error) {
+	switch MigrateFlags.LogFormat {
+	case logFormatTTY:
+		return &LogTTY{out}, nil
+	default:
+		return nil, fmt.Errorf("unknown log-format %q", MigrateFlags.LogFormat)
 	}
 }

@@ -31,6 +31,18 @@ func TestMigrate(t *testing.T) {
 	require.NoError(t, err)
 }
 
+func TestMigrate_Apply(t *testing.T) {
+	p := t.TempDir()
+
+	s, err := runCmd(
+		Root, "migrate", "apply",
+		"--dir", "file://"+p,
+		"--to", openSQLite(t, ""),
+	)
+	fmt.Println(s)
+	require.NoError(t, err)
+}
+
 func TestMigrate_Diff(t *testing.T) {
 	p := t.TempDir()
 
